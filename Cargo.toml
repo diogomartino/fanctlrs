@@ -1,0 +1,11 @@
+[package]
+name = "fanctlrs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = "0.8.0"
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+
+[profile.release]
+strip = true

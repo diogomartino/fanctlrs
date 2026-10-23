@@ -1,0 +1,67 @@
+name: Build & release
+
+# Every push and pull request: build and test.
+# Actions > Build & release > Run workflow: also bump the version, tag it and publish a release.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System libraries (gpui)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            libx11-xcb-dev libwayland-dev libvulkan-dev libfontconfig-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bump version
+        id: version
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          IFS=. read -r major minor patch <<< "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            *)     patch=$((patch + 1)) ;;
+          esac
+          version="$major.$minor.$patch"
+          sed -i "0,/^version = .*/s//version = \"$version\"/" Cargo.toml
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Also updates Cargo.lock to the bumped version.
+      - run: cargo test --release
+      - run: cargo build --release
+
+      - name: Tag and publish release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release v$VERSION"
+          git tag "v$VERSION"
+          git push --atomic origin "HEAD:${{ github.ref_name }}" "v$VERSION"
+
+          archive="fanctlrs-v$VERSION-x86_64-linux.tar.gz"
+          tar -czf "$archive" -C target/release fanctlrs -C "$GITHUB_WORKSPACE" README.md
+          gh release create "v$VERSION" "$archive" --title "fanctlrs v$VERSION" --generate-notes

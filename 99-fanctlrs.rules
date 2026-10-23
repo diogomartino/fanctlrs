@@ -1,0 +1,3 @@
+# Let the wheel group write fan controls (pwmN, pwmN_enable) on any hwmon chip,
+# so fanctlrs runs without sudo. Debian/Ubuntu: change "wheel" to "sudo".
+ACTION=="add", SUBSYSTEM=="hwmon", RUN+="/bin/sh -c 'for f in /sys%p/pwm[0-9] /sys%p/pwm[0-9]_enable; do [ -e $f ] && chgrp wheel $f && chmod g+w $f; done; true'"
