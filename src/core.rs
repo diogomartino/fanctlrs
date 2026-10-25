@@ -221,6 +221,16 @@ pub fn curve_key(fan_key: &str) -> String {
     format!("{fan_key}#curve")
 }
 
+/// Is the fan out of manual mode? `pwmN_enable = 0` is "full speed", and some
+/// drivers (it87) report manual 100% (duty 255) that way, so that one still counts as ours.
+fn firmware_took_back(enable: Option<f64>, duty: Option<f64>) -> bool {
+    match enable {
+        Some(1.0) => false,
+        Some(0.0) => duty != Some(255.0),
+        _ => true,
+    }
+}
+
 /// One control step for one fan. Returns true when the firmware had taken
 /// the fan back (BIOS/EC, suspend/resume) and we re-applied the user's setting.
 /// `temp` is the curve sensor's reading in °C; unreadable means full speed.
@@ -234,7 +244,7 @@ pub fn enforce(dir: &Path, n: u32, mode: &Mode, curve: Option<&Curve>, temp: Opt
         },
         (Mode::Curve, None) => 100.0,
     };
-    let taken_back = read_num(fan_file(dir, n, "pwmN_enable")) != Some(1.0);
+    let taken_back = firmware_took_back(read_num(fan_file(dir, n, "pwmN_enable")), read_num(fan_file(dir, n, "pwmN")));
     let duty = pct_to_duty(pct);
     // Some drivers (amdgpu) read back a slightly different duty than written.
     let off = read_num(fan_file(dir, n, "pwmN")).is_none_or(|d| (d - duty as f64).abs() > 2.0);
@@ -265,12 +275,23 @@ pub fn daemon_running() -> bool {
     running_cmdline("daemon").is_some_and(|cmd| cmd.contains("--daemon"))
 }
 
-pub fn mark_gui_running() {
-    let _ = fs::write(pid_file("gui"), std::process::id().to_string());
+/// Open windows: every `fanctlrs` process of this user that isn't the daemon.
+/// Found by scanning /proc instead of a pid file, which goes stale when a
+/// second window opens and closes.
+fn gui_pids() -> Vec<String> {
+    let me = std::process::id().to_string();
+    fs::read_dir("/proc")
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pid| pid.bytes().all(|b| b.is_ascii_digit()) && *pid != me)
+        .filter(|pid| fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "fanctlrs"))
+        .filter(|pid| fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| !String::from_utf8_lossy(&c).contains("--daemon")))
+        .collect()
 }
 
 fn gui_running() -> bool {
-    running_cmdline("gui").is_some_and(|cmd| cmd.contains("fanctlrs") && !cmd.contains("--daemon"))
+    !gui_pids().is_empty()
 }
 
 /// Start the window from the tray as its own transient systemd unit:
@@ -294,6 +315,31 @@ fn open_gui() {
     }
 }
 
+/// Tray "Exit": close the window, give every fan back to the firmware (a
+/// stopped daemon would otherwise leave them frozen at their last speed) and
+/// stop the service. The `fans` file is kept, so the next start restores it.
+fn exit_all() {
+    let windows = gui_pids();
+    if !windows.is_empty() {
+        let _ = Command::new("kill").args(&windows).status();
+    }
+    let state = parse_kv(&read_config("fans"));
+    let chips = chips();
+    for (key, mode) in &state {
+        if Mode::parse(mode).is_some_and(|m| m != Mode::Auto) {
+            if let Some((dir, n)) = fan_location(&chips, key) {
+                let _ = fan_write(&dir, n, "pwmN", AUTO_SEED_DUTY);
+                let _ = fan_write(&dir, n, "pwmN_enable", 2);
+            }
+        }
+    }
+    // --no-block: systemd stops the unit while we exit cleanly ourselves, so
+    // Restart=on-failure doesn't bring it back. Also covers a daemon started by hand.
+    let _ = Command::new("systemctl").args(["--user", "--no-block", "stop", "fanctlrs"]).status();
+    let _ = fs::remove_file(pid_file("daemon"));
+    std::process::exit(0);
+}
+
 struct FanTray;
 
 impl ksni::Tray for FanTray {
@@ -314,7 +360,11 @@ impl ksni::Tray for FanTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        vec![ksni::menu::StandardItem { label: "Open fanctlrs".into(), activate: Box::new(|_| open_gui()), ..Default::default() }.into()]
+        vec![
+            ksni::menu::StandardItem { label: "Open fanctlrs".into(), activate: Box::new(|_| open_gui()), ..Default::default() }.into(),
+            ksni::MenuItem::Separator,
+            ksni::menu::StandardItem { label: "Exit".into(), activate: Box::new(|_| exit_all()), ..Default::default() }.into(),
+        ]
     }
 }
 
@@ -584,5 +634,14 @@ mod tests {
         assert_eq!(Mode::parse("40"), Some(Mode::Manual(40.0)));
         assert_eq!(Mode::parse("loud"), None);
         assert_eq!(Mode::Manual(40.0).format(), "40");
+    }
+
+    #[test]
+    fn full_speed_counts_as_manual_100() {
+        assert!(!firmware_took_back(Some(1.0), Some(120.0)));
+        assert!(!firmware_took_back(Some(0.0), Some(255.0))); // it87: manual 100%
+        assert!(firmware_took_back(Some(0.0), Some(120.0)));
+        assert!(firmware_took_back(Some(2.0), Some(255.0)));
+        assert!(firmware_took_back(None, None));
     }
 }

@@ -1059,7 +1059,15 @@ impl Render for FanControl {
                     .id("main")
                     .size_full()
                     .overflow_y_scrollbar()
-                    .child(v_flex().p_6().gap_8().children(error).child(content)),
+                    .child(
+                        v_flex().p_6().gap_8().children(error).child(content).child(
+                            div()
+                                .text_xs()
+                                .text_center()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(concat!("fanctlrs v", env!("CARGO_PKG_VERSION"))),
+                        ),
+                    ),
             )
     }
 }
@@ -1076,7 +1084,6 @@ fn main() {
         eprintln!("fanctlrs: no display (WAYLAND_DISPLAY/DISPLAY not set)");
         std::process::exit(1);
     }
-    core::mark_gui_running();
     application().with_assets(assets::AllAssets).run(|cx| {
         init(cx);
         // Closing the window ends the app; the tray (in the daemon) can reopen it.
