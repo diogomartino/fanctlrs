@@ -1070,6 +1070,12 @@ fn main() {
         return;
     }
 
+    // Without a display the window can't open; don't linger invisibly
+    // (the tray would think the window is already open).
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+        eprintln!("fanctlrs: no display (WAYLAND_DISPLAY/DISPLAY not set)");
+        std::process::exit(1);
+    }
     core::mark_gui_running();
     application().with_assets(assets::AllAssets).run(|cx| {
         init(cx);

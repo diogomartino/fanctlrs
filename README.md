@@ -5,6 +5,21 @@ A small Linux app to watch your sensors and control your fans and pumps.
 It works with any fan the kernel exposes as `pwmN` under `/sys/class/hwmon`:
 most motherboards (once the right driver is loaded) and AMD GPUs.
 
+> [!WARNING]
+> fanctlrs has only been tested on one system:
+>
+> |             |                                                                |
+> | ----------- | -------------------------------------------------------------- |
+> | Motherboard | ASUS ROG STRIX X470-F GAMING (BIOS 5861), ITE IT8665E fan chip |
+> | Fan driver  | `it87-dkms-git` (out-of-tree `it87`)                           |
+> | CPU         | AMD Ryzen 7 5800X                                              |
+> | GPU         | AMD Radeon RX 6800 (Navi 21, `amdgpu`)                         |
+> | OS          | EndeavourOS (Arch), kernel 7.2                                 |
+> | Desktop     | KDE Plasma 6.8, Wayland                                        |
+>
+> It writes directly to your fan controller. On other hardware, check that each fan
+> responds as expected before relying on it, and keep an eye on your temperatures.
+
 ## 1. Find your fan chip
 
 ```bash
@@ -16,23 +31,29 @@ Look for a line like `Found 'ITE IT8665E Super IO Sensors'` or `Found 'Nuvoton N
 
 ## 2. Install the driver if your chip needs one
 
-| Chip | Driver |
-|---|---|
-| Nuvoton NCT67xx | `nct6775`, already in the kernel |
+| Chip                | Driver                                                                                                                                                                 |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Nuvoton NCT67xx     | `nct6775`, already in the kernel                                                                                                                                       |
 | ITE IT86xx / IT87xx | older chips: `it87`, already in the kernel. Newer ones (IT8665E, IT8686E, IT8688E…) need [it87](https://github.com/frankcrawford/it87): `yay -S it87-dkms-git` on Arch |
-| AMD GPU | `amdgpu`, already loaded |
+| AMD GPU             | `amdgpu`, already loaded                                                                                                                                               |
 
 This is the only step the app can't do for you.
 
-## 3. Get fanctlrs
-
-Download `fanctlrs-vX.Y.Z-x86_64-linux.tar.gz` from the Releases page, extract it and run
-`./fanctlrs`. Or build it yourself ([Rust](https://rustup.rs) 1.92 or newer):
+## 3. Install fanctlrs
 
 ```bash
-cargo run --release
+curl -fsSL https://raw.githubusercontent.com/diogomartino/fanctlrs/main/install.sh | bash
 ```
 
+It installs the latest release for your user (no `sudo`) to `~/.local/bin/fanctlrs` and adds
+it to your app menu. Run the same command again to update; it restarts the background service
+on the new version. To uninstall:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/diogomartino/fanctlrs/main/install.sh | bash -s -- --uninstall
+```
+
+Or build it yourself ([Rust](https://rustup.rs) 1.92 or newer): `cargo run --release`.
 Run it as your normal user, never with `sudo`.
 
 ## 4. Setup, from the app
@@ -76,17 +97,17 @@ To find which header is which: set one fan to 0% and see which one stops.
 Everything you change is saved in `~/.config/fanctlrs/` and restored on the next launch,
 including each fan's speed (or Auto):
 
-| File | What |
-|---|---|
-| `names` | your renames. You can also write `chip/sensor = Name` lines by hand (names as `sensors` prints them, e.g. `it8665/fan6 = Water Pump`) |
-| `hidden-sensors` | what you hid with Show / hide |
-| `fans` | each fan's mode (`auto`, `curve` or a %) and its curve (`key#curve = sensor temp:% …`) |
-| `profiles/<name>` | saved profiles, same format as `fans` |
+| File              | What                                                                                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `names`           | your renames. You can also write `chip/sensor = Name` lines by hand (names as `sensors` prints them, e.g. `it8665/fan6 = Water Pump`) |
+| `hidden-sensors`  | what you hid with Show / hide                                                                                                         |
+| `fans`            | each fan's mode (`auto`, `curve` or a %) and its curve (`key#curve = sensor temp:% …`)                                                |
+| `profiles/<name>` | saved profiles, same format as `fans`                                                                                                 |
 
 ## Fan curves
 
 Click **Curve** on a fan to make it follow a temperature. Pick the sensor with the
-button next to *Follows* (the CPU by default), then set 4 points: **−/+** move a point's
+button next to _Follows_ (the CPU by default), then set 4 points: **−/+** move a point's
 temperature, the slider sets the fan % at that temperature. Between points the speed is
 interpolated; below the first and above the last it stays flat.
 

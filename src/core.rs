@@ -273,15 +273,18 @@ fn gui_running() -> bool {
     running_cmdline("gui").is_some_and(|cmd| cmd.contains("fanctlrs") && !cmd.contains("--daemon"))
 }
 
-/// Start the window from the tray. Its own systemd scope, so restarting the
-/// service (e.g. reinstalling it from that window) doesn't kill the window.
+/// Start the window from the tray as its own transient systemd unit:
+/// - it gets the user manager's *current* environment. The daemon may have
+///   started at boot, before the desktop exported WAYLAND_DISPLAY/DISPLAY,
+///   so its own environment can't open a window.
+/// - restarting the service (e.g. reinstalling it from that window) doesn't kill it.
 fn open_gui() {
     if gui_running() {
         return;
     }
     let Ok(exe) = std::env::current_exe() else { return };
     let child = Command::new("systemd-run")
-        .args(["--user", "--scope", "--quiet", "--collect"])
+        .args(["--user", "--quiet", "--collect"])
         .arg(&exe)
         .spawn()
         .or_else(|_| Command::new(&exe).spawn());
