@@ -493,6 +493,26 @@ pub fn uninstall_service() -> Result<(), String> {
 
 /// Can this user write fan controls? (Opening a sysfs file for writing
 /// without writing changes nothing.)
+/// CPU energy counters (RAPL), for the CPU power sensors: (name, counter, wrap-around point in µJ).
+pub fn cpu_energy_counters() -> Vec<(String, PathBuf, f64)> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/powercap")
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    dirs.sort();
+    dirs.into_iter()
+        .filter(|d| d.join("energy_uj").exists())
+        .filter_map(|d| {
+            let name = fs::read_to_string(d.join("name")).ok()?.trim().to_string();
+            Some((name, d.join("energy_uj"), read_num(d.join("max_energy_range_uj"))?))
+        })
+        .collect()
+}
+
+/// The udev rule makes the energy counters readable too. True when there are none.
+pub fn cpu_energy_readable() -> bool {
+    cpu_energy_counters().iter().all(|(_, path, _)| fs::File::open(path).is_ok())
+}
+
 pub fn fans_writable(chips: &[Chip]) -> bool {
     chips.iter().flat_map(|c| (1..=16).map(move |n| fan_file(&c.dir, n, "pwmN_enable"))).filter(|p| p.exists()).any(|p| fs::OpenOptions::new().write(true).open(p).is_ok())
 }
@@ -541,6 +561,7 @@ pub fn setup_system() -> Result<(), String> {
     );
     script += "if [ -d /sys/module/it87 ]; then echo 'options it87 ignore_resource_conflict=1' > /etc/modprobe.d/fanctlrs.conf; fi\n";
     script += "udevadm trigger --subsystem-match=hwmon --action=add\n";
+    script += "udevadm trigger --subsystem-match=powercap --action=add\n";
 
     let mut child = Command::new("pkexec")
         .args(["sh", "-c", &script])

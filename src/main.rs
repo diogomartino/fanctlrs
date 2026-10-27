@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs, io,
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui_kit::component::{
@@ -48,6 +48,11 @@ enum Kind {
     Volt,
     Curr,
     Power,
+    /// Clock speed, raw in Hz.
+    Freq,
+    Percent,
+    /// Memory, raw in bytes.
+    Bytes,
 }
 
 impl Kind {
@@ -58,6 +63,9 @@ impl Kind {
             Kind::Volt => (assets::IconName::Zap, t.warning),
             Kind::Curr => (assets::IconName::Activity, t.success),
             Kind::Power => (assets::IconName::Plug, t.chart_4),
+            Kind::Freq => (assets::IconName::Gauge, t.chart_2),
+            Kind::Percent => (assets::IconName::ChartNoAxesColumn, t.chart_3),
+            Kind::Bytes => (assets::IconName::MemoryStick, t.chart_5),
         }
     }
 
@@ -68,6 +76,9 @@ impl Kind {
             Kind::Volt => format!("{:.2} V", raw / 1000.0),
             Kind::Curr => format!("{:.2} A", raw / 1000.0),
             Kind::Power => format!("{:.1} W", raw / 1_000_000.0),
+            Kind::Freq => format!("{:.0} MHz", raw / 1_000_000.0),
+            Kind::Percent => format!("{raw:.0} %"),
+            Kind::Bytes => format!("{:.2} GiB", raw / 1024f64.powi(3)),
         }
     }
 }
@@ -84,6 +95,7 @@ fn parse_sensor_file(file: &str) -> Option<(Kind, u32, &str)> {
         "in" => Kind::Volt,
         "curr" => Kind::Curr,
         "power" => Kind::Power,
+        "freq" => Kind::Freq,
         _ => return None,
     };
     Some((kind, base[digits..].parse().ok()?, base))
@@ -96,7 +108,55 @@ fn default_label(chip: &Chip, base: &str, names: &HashMap<String, String>) -> St
         .get(&format!("{}/{base}", chip.name))
         .cloned()
         .or_else(|| fs::read_to_string(chip.dir.join(format!("{base}_label"))).ok().map(|l| l.trim().to_string()))
+        .map(|l| match l.as_str() {
+            // amdgpu's clock labels
+            "sclk" => "Core clock".to_string(),
+            "mclk" => "VRAM clock".to_string(),
+            _ => l,
+        })
         .unwrap_or_else(|| base.to_string())
+}
+
+/// Busy and used time from the `cpu` line of /proc/stat: (idle, total).
+fn cpu_times(stat: &str) -> Option<(u64, u64)> {
+    let fields: Vec<u64> = stat.lines().next()?.strip_prefix("cpu ")?.split_whitespace().take(8).map(|f| f.parse().ok()).collect::<Option<_>>()?;
+    // user nice system idle iowait irq softirq steal
+    Some((fields[3] + fields[4], fields.iter().sum()))
+}
+
+/// CPU load % since the previous sample, from /proc/stat.
+fn cpu_load(prev: &mut Option<(u64, u64)>) -> Option<f64> {
+    let now = cpu_times(&fs::read_to_string("/proc/stat").ok()?)?;
+    let load = prev.and_then(|(idle, total)| {
+        let (didle, dtotal) = (now.0.saturating_sub(idle), now.1.saturating_sub(total));
+        (dtotal > 0).then(|| 100.0 * (1.0 - didle as f64 / dtotal as f64))
+    });
+    *prev = Some(now);
+    load
+}
+
+/// RAM in use (total - available), in bytes, from /proc/meminfo.
+fn ram_used(meminfo: &str) -> Option<f64> {
+    let kb = |key: &str| meminfo.lines().find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse::<f64>().ok());
+    Some((kb("MemTotal:")? - kb("MemAvailable:")?) * 1024.0)
+}
+
+/// Average power in µW between two readings of an energy counter (µJ), which
+/// wraps around to 0 after `max`.
+fn energy_power(prev: f64, now: f64, max: f64, secs: f64) -> Option<f64> {
+    let used = if now >= prev { now - prev } else { now + max - prev };
+    (secs > 0.0).then(|| used / secs)
+}
+
+/// How a sensor's value is obtained.
+#[derive(Clone, Copy)]
+enum Read {
+    /// An energy counter in µJ at `path` that wraps at this value; shown as power.
+    Energy(f64),
+    /// A number in `path`, times this factor (cpufreq reports kHz, Kind::Freq wants Hz).
+    File(f64),
+    RamUsed,
+    CpuLoad,
 }
 
 struct Sensor {
@@ -104,7 +164,22 @@ struct Sensor {
     default: String,
     kind: Kind,
     path: PathBuf,
+    read: Read,
     value: Option<f64>,
+    /// Last energy reading and when, for `Read::Energy`.
+    prev: Option<(f64, Instant)>,
+    /// Exists but this user may not read it (CPU energy before Fix).
+    denied: bool,
+}
+
+impl Sensor {
+    fn file(key: String, default: String, kind: Kind, path: PathBuf, scale: f64) -> Self {
+        Sensor { key, default, kind, path, read: Read::File(scale), value: None, prev: None, denied: false }
+    }
+
+    fn computed(key: &str, default: &str, kind: Kind, read: Read) -> Self {
+        Sensor { key: key.into(), default: default.into(), kind, path: PathBuf::new(), read, value: None, prev: None, denied: false }
+    }
 }
 
 struct Group {
@@ -114,7 +189,7 @@ struct Group {
 }
 
 fn discover_sensors(chips: &[Chip], names: &HashMap<String, String>) -> Vec<Group> {
-    chips
+    let mut groups = chips
         .iter()
         .filter_map(|chip| {
             let mut sensors: Vec<(u32, Sensor)> = fs::read_dir(&chip.dir)
@@ -123,16 +198,26 @@ fn discover_sensors(chips: &[Chip], names: &HashMap<String, String>) -> Vec<Grou
                 .filter_map(|e| {
                     let file = e.file_name().to_string_lossy().into_owned();
                     let (kind, n, base) = parse_sensor_file(&file)?;
-                    let sensor = Sensor {
-                        key: format!("{}/{base}", chip.key),
-                        default: default_label(chip, base, names),
-                        kind,
-                        path: e.path(),
-                        value: None,
-                    };
+                    let sensor = Sensor::file(format!("{}/{base}", chip.key), default_label(chip, base, names), kind, e.path(), 1.0);
                     Some((kind as u32 * 1000 + n, sensor))
                 })
                 .collect();
+            // amdgpu keeps load and VRAM numbers next to the device, not in hwmon.
+            if chip.name == "amdgpu" {
+                let extras = [
+                    ("gpu_busy_percent", "GPU load", Kind::Percent),
+                    ("mem_busy_percent", "VRAM load", Kind::Percent),
+                    ("mem_info_vram_used", "VRAM used", Kind::Bytes),
+                ];
+                for (i, (file, label, kind)) in extras.into_iter().enumerate() {
+                    let path = chip.dir.join("device").join(file);
+                    if path.exists() {
+                        let key = format!("{}/{file}", chip.key);
+                        let label = names.get(&format!("{}/{file}", chip.name)).cloned().unwrap_or(label.into());
+                        sensors.push((kind as u32 * 1000 + i as u32, Sensor::file(key, label, kind, path, 1.0)));
+                    }
+                }
+            }
             if sensors.is_empty() {
                 return None;
             }
@@ -143,7 +228,59 @@ fn discover_sensors(chips: &[Chip], names: &HashMap<String, String>) -> Vec<Grou
                 sensors: sensors.into_iter().map(|s| s.1).collect(),
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    // Everything about the CPU in one group: load and power first, then the
+    // driver's temperatures, then per-thread clocks. Keys keep their old
+    // "system/…" and "cpufreq/…" names so hidden sensors and renames carry over.
+    let cpu = match groups.iter().position(|g| ["k10temp", "zenpower", "coretemp"].iter().any(|c| g.key.starts_with(c))) {
+        Some(i) => i,
+        None => {
+            groups.push(Group { key: "cpu".into(), default: "CPU".into(), sensors: Vec::new() });
+            groups.len() - 1
+        }
+    };
+    let mut first = vec![Sensor::computed("system/cpu_load", "CPU load", Kind::Percent, Read::CpuLoad)];
+    for (name, path, max) in core::cpu_energy_counters() {
+        let (file, label) = match name.as_str() {
+            "package-0" => ("cpu_package_power", "CPU power"),
+            "core" => ("cpu_core_power", "CPU cores power"),
+            _ => continue,
+        };
+        let key = format!("system/{file}");
+        if first.iter().all(|s| s.key != key) {
+            first.push(Sensor { read: Read::Energy(max), ..Sensor::file(key, label.into(), Kind::Power, path, 1.0) });
+        }
+    }
+    groups[cpu].sensors.splice(0..0, first);
+
+    let mut threads: Vec<u32> = fs::read_dir("/sys/devices/system/cpu")
+        .map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.strip_prefix("cpu")?.parse().ok()).collect())
+        .unwrap_or_default();
+    threads.sort();
+    groups[cpu].sensors.extend(
+        threads
+            .into_iter()
+            .map(|n| (n, PathBuf::from(format!("/sys/devices/system/cpu/cpu{n}/cpufreq/scaling_cur_freq"))))
+            .filter(|(_, path)| path.exists())
+            .map(|(n, path)| Sensor::file(format!("cpufreq/cpu{n}"), format!("CPU {n} clock"), Kind::Freq, path, 1000.0)),
+    );
+
+    groups.push(Group {
+        key: "system".into(),
+        default: "Memory".into(),
+        sensors: vec![Sensor::computed("system/ram_used", "RAM used", Kind::Bytes, Read::RamUsed)],
+    });
+
+    // CPU, GPU, memory, then the rest in hardware order (the sort is stable).
+    let rank = |key: &str| match key.split('@').next().unwrap_or(key) {
+        "k10temp" | "zenpower" | "coretemp" | "cpu" => 0,
+        "amdgpu" | "nouveau" => 1,
+        "system" => 2,
+        _ => 3,
+    };
+    groups.sort_by_key(|g| rank(&g.key));
+    groups
 }
 
 struct Fan {
@@ -187,6 +324,8 @@ struct Service {
     running: bool,
     /// Whether this user may write fan controls (the udev rule is in place).
     writable: bool,
+    /// Whether this user may read the CPU energy counters (same udev rule).
+    energy_readable: bool,
     motherboard_fans: bool,
     driver_at_boot: bool,
     starts_at_boot: bool,
@@ -211,7 +350,7 @@ impl Service {
         [
             ("driver", self.motherboard_fans),
             ("boot", self.driver_at_boot),
-            ("permission", self.writable),
+            ("permission", self.writable && self.energy_readable),
             ("service", self.installed),
         ]
     }
@@ -222,6 +361,7 @@ impl Service {
         self.installed = core::service_installed();
         self.running = daemon_running();
         self.writable = fans_writable(&chips);
+        self.energy_readable = core::cpu_energy_readable();
         self.motherboard_fans = core::motherboard_fans(&chips);
         self.driver_at_boot = core::driver_loads_at_boot();
         self.starts_at_boot = core::starts_at_boot();
@@ -230,6 +370,8 @@ impl Service {
 
 struct FanControl {
     groups: Vec<Group>,
+    /// Previous /proc/stat sample for the CPU load sensor.
+    cpu_prev: Option<(u64, u64)>,
     fans: Vec<Fan>,
     names: HashMap<String, String>,
     hidden: HashSet<String>,
@@ -326,6 +468,7 @@ impl FanControl {
 
         let mut this = Self {
             groups,
+            cpu_prev: None,
             fans,
             names,
             hidden: read_config("hidden-sensors").lines().map(String::from).collect(),
@@ -405,7 +548,18 @@ impl FanControl {
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for s in self.groups.iter_mut().flat_map(|g| &mut g.sensors) {
             if !self.hidden.contains(&s.key) {
-                s.value = read_num(&s.path);
+                s.value = match s.read {
+                    Read::File(scale) => read_num(&s.path).map(|v| v * scale),
+                    Read::RamUsed => fs::read_to_string("/proc/meminfo").ok().and_then(|m| ram_used(&m)),
+                    Read::CpuLoad => cpu_load(&mut self.cpu_prev),
+                    Read::Energy(max) => {
+                        s.denied = fs::File::open(&s.path).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+                        let now = read_num(&s.path).map(|uj| (uj, Instant::now()));
+                        let power = s.prev.zip(now).and_then(|((p, pt), (n, nt))| energy_power(p, n, max, (nt - pt).as_secs_f64()));
+                        s.prev = now;
+                        power
+                    }
+                };
             }
         }
         self.service.installed = core::service_installed();
@@ -722,7 +876,11 @@ impl FanControl {
                             .gap_2()
                             .child(Icon::new(icon).small().text_color(color))
                             .child(div().flex_1().min_w_0().child(self.renamable(&s.key, &s.default, cx)))
-                            .child(div().font_semibold().child(s.value.map_or("—".into(), |v| s.kind.format(v))))
+                            .child(match s.value {
+                                Some(v) => div().font_semibold().child(s.kind.format(v)),
+                                None if s.denied => div().text_color(t.warning).child("needs Fix"),
+                                None => div().font_semibold().child("—"),
+                            })
                     })),
             )
         });
@@ -1014,7 +1172,7 @@ impl FanControl {
                     .gap_1()
                     .child(row(s.motherboard_fans, "Motherboard fan driver loaded", None))
                     .child(row(s.driver_at_boot, "Driver loads at boot", None))
-                    .child(row(s.writable, "This user can control fans", None))
+                    .child(row(s.writable && s.energy_readable, "This user can control fans and read CPU power", None))
                     .children(fix.map(|b| h_flex().justify_end().pt_1().child(b.small().disabled(s.busy)))),
             )
             .child(
@@ -1108,7 +1266,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, matches_profile, needs_onboarding, parse_sensor_file};
+    use super::{Kind, cpu_times, energy_power, matches_profile, needs_onboarding, parse_sensor_file, ram_used};
     use crate::core::parse_kv;
 
     #[test]
@@ -1144,5 +1302,24 @@ mod tests {
         assert!(!needs_onboarding(&missing, Some("driver\nboot\npermission")));
         // ...until something that worked breaks.
         assert!(needs_onboarding(&broken, Some("driver\nboot\npermission")));
+    }
+
+    #[test]
+    fn system_sensors() {
+        assert_eq!(parse_sensor_file("freq1_input"), Some((Kind::Freq, 1, "freq1")));
+        assert_eq!(Kind::Freq.format(4_775_112_000.0), "4775 MHz");
+        assert_eq!(Kind::Bytes.format(1_367_453_696.0), "1.27 GiB");
+        assert_eq!(cpu_times("cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 1 2 3\n"), Some((850, 1000)));
+        assert_eq!(cpu_times("garbage"), None);
+        assert_eq!(ram_used("MemTotal:  32 kB\nMemFree: 1 kB\nMemAvailable:  12 kB\n"), Some(20.0 * 1024.0));
+    }
+
+    #[test]
+    fn cpu_power() {
+        // 45 J in 1.5 s = 30 W (in µW, like hwmon power)
+        assert_eq!(energy_power(1_000_000.0, 46_000_000.0, 1e12, 1.5), Some(30_000_000.0));
+        // the counter wrapped: 10 J before the wrap + 20 J after it, in 1 s
+        assert_eq!(energy_power(990_000_000.0, 20_000_000.0, 1_000_000_000.0, 1.0), Some(30_000_000.0));
+        assert_eq!(energy_power(0.0, 1.0, 1e12, 0.0), None);
     }
 }
