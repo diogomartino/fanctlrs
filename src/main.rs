@@ -1126,7 +1126,8 @@ impl FanControl {
                 .children(action.map(|b| b.small().disabled(s.busy)))
         };
 
-        let needs_fix = !(s.motherboard_fans && s.driver_at_boot && s.writable);
+        // Everything Fix handles, i.e. every setup item except the service.
+        let needs_fix = s.items().iter().any(|(name, ok)| *name != "service" && !ok);
         let fix = needs_fix.then(|| {
             Button::new("setup-fix")
                 .label("Fix (asks for password)")

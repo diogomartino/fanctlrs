@@ -1,10 +1,11 @@
 name: Build & release
 
-# Every push and pull request: build and test.
-# Actions > Build & release > Run workflow: also bump the version, tag it and publish a release.
+# Every push to main: bump the patch version, tag it and publish a release.
+# Pull requests: build and test only.
+# Actions > Build & release > Run workflow: release with a minor or major bump instead.
 on:
   push:
-    branches: [master, main]
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -17,11 +18,25 @@ on:
 permissions:
   contents: write
 
+# Releases run one at a time, so two quick pushes can't claim the same version.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: false
+
+env:
+  RELEASE: ${{ github.event_name != 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # The bot's own "Release vX.Y.Z" commit doesn't start another release.
+    if: ${{ !startsWith(github.event.head_commit.message, 'Release v') }}
     steps:
+      # A release builds on the latest main (which may already hold an earlier
+      # run's release commit), so its push is a fast-forward.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.ref_name }}
 
       - name: System libraries (gpui)
         run: |
@@ -34,10 +49,10 @@ jobs:
 
       - name: Bump version
         id: version
-        if: github.event_name == 'workflow_dispatch'
+        if: env.RELEASE == 'true'
         run: |
           IFS=. read -r major minor patch <<< "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          case "${{ inputs.bump }}" in
+          case "${{ inputs.bump || 'patch' }}" in
             major) major=$((major + 1)); minor=0; patch=0 ;;
             minor) minor=$((minor + 1)); patch=0 ;;
             *)     patch=$((patch + 1)) ;;
@@ -51,7 +66,7 @@ jobs:
       - run: cargo build --release
 
       - name: Tag and publish release
-        if: github.event_name == 'workflow_dispatch'
+        if: env.RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}

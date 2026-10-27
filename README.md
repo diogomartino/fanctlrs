@@ -80,9 +80,11 @@ Logs of the service: `journalctl --user -u fanctlrs`.
 
 ## Releasing
 
-Every push builds and tests the app on GitHub. To publish a release: **Actions → Build &
-release → Run workflow**, pick patch, minor or major. It bumps the version in `Cargo.toml`,
-commits and tags it, and attaches the binary to a new GitHub release.
+Every push to `main` publishes a release: GitHub bumps the patch version in `Cargo.toml`,
+builds and tests, commits and tags `Release vX.Y.Z`, and attaches the binary to a new
+GitHub release. Pull requests are only built and tested.
+
+For a minor or major bump instead: **Actions → Build & release → Run workflow**.
 
 ## Naming things
 
