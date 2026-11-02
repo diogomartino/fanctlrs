@@ -1566,6 +1566,7 @@ version = "0.1.3"
 dependencies = [
  "gpui-kit",
  "ksni",
+ "libc",
 ]
 
 [[package]]

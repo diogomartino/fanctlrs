@@ -105,6 +105,7 @@ including each fan's speed (or Auto):
 | `hidden-sensors`  | what you hid with Show / hide                                                                                                         |
 | `fans`            | each fan's mode (`auto`, `curve` or a %) and its curve (`key#curve = sensor temp:% …`)                                                |
 | `profiles/<name>` | saved profiles, same format as `fans`                                                                                                 |
+| `lights`          | each ARGB channel's LED count and color (`ch1 = 36 ffffff`)                                                                           |
 
 ## Fan curves
 
@@ -126,6 +127,14 @@ applied. The **×** next to it deletes it.
 
 Run the app as your normal user (see step 4), not with `sudo`. Otherwise these files
 end up owned by root and the app can't save.
+
+## Lighting
+
+With a **Nollie 16CH** ARGB controller plugged in, a **Lighting** section shows up. For each
+channel, click the LED count and type how many LEDs are on it (add them up for daisy-chained
+fans, e.g. 3 × 12 = 36). Then pick a color for that channel, or use **All** to set every channel
+at once. The background service keeps the colors applied. Close OpenRGB, or the two fight over
+the colors. If the colors don't change, click **Fix** under Setup.
 
 ## Good to know
 

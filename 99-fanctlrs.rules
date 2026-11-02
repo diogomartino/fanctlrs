@@ -5,3 +5,5 @@ ACTION=="add", SUBSYSTEM=="hwmon", RUN+="/bin/sh -c 'for f in /sys%p/pwm[0-9] /s
 # Root-only by default since the PLATYPUS side channel; members of this group can
 # become root anyway.
 ACTION=="add", SUBSYSTEM=="powercap", RUN+="/bin/sh -c 'f=/sys%p/energy_uj; [ -e $$f ] && chgrp wheel $$f && chmod g+r $$f; true'"
+# Let the same group set the colors on a Nollie 16CH ARGB controller.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3061", ATTRS{idProduct}=="4716", GROUP="wheel", MODE="0660"

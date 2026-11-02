@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs, io,
     path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -11,19 +12,115 @@ use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, Theme,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
+    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     h_flex,
     input::{Input, InputEvent, InputState},
     popover::Popover,
     scroll::ScrollableElement,
     slider::{Slider, SliderEvent, SliderState},
+    switch::Switch,
     v_flex,
 };
 use gpui_kit::*;
 
 use crate::core::{
-    AUTO_SEED_DUTY, Chip, Curve, Mode, chips, config_dir, curve_key, daemon_running, enforce, fan_file, fans_writable,
-    format_kv, parse_kv, pct_to_duty, read_config, read_num,
+    AUTO_SEED_DUTY, Chip, Curve, Effect, LIGHT_CHANNELS, Light, MAX_LEDS, Mode, chips, config_dir, curve_key, daemon_running, enforce,
+    fan_file, fans_writable, format_kv, parse_kv, pct_to_duty, read_config, read_num,
 };
+
+/// `editing` key prefix for a light channel's LED count, `leds:3`.
+const LEDS: &str = "leds:";
+
+/// The channel-by-channel lighting setup: one channel lit at a time.
+struct Guide {
+    channel: usize,
+    name: Entity<InputState>,
+    leds: Entity<InputState>,
+    _subs: Vec<Subscription>,
+}
+
+/// The guide's channel: all white until a count is typed, then that many
+/// green and the rest red, so the count is right once nothing is red.
+fn guide_frame(channel: usize, leds: Option<u16>) -> core::Frame {
+    let mut frame = core::dark_frame();
+    frame[channel] = (0..MAX_LEDS)
+        .map(|j| match leds {
+            None | Some(0) => [255, 255, 255],
+            Some(n) if j < n => [0, 255, 0],
+            Some(_) => [255, 0, 0],
+        })
+        .collect();
+    frame
+}
+
+/// What to send to the lights; `None` leaves that device alone.
+#[derive(Default)]
+struct LightJob {
+    frame: Option<core::Frame>,
+    aura: Option<(HashMap<u8, [u8; 3]>, Effect, u8)>,
+}
+
+/// Sends lights off the UI thread: a color slider fires a change per pixel dragged,
+/// and the motherboard chip takes tens of ms per update. Only the latest job is
+/// sent, and a device only when its colors changed. Errors land in the returned slot.
+fn spawn_light_sender(aura: Option<core::Aura>) -> (mpsc::Sender<LightJob>, Arc<Mutex<Option<String>>>) {
+    let (tx, rx) = mpsc::channel::<LightJob>();
+    let error = Arc::new(Mutex::new(None));
+    let slot = error.clone();
+    std::thread::spawn(move || {
+        let (mut sent_frame, mut sent_aura) = (None, None);
+        while let Ok(mut job) = rx.recv() {
+            for later in rx.try_iter() {
+                job.frame = later.frame.or(job.frame);
+                job.aura = later.aura.or(job.aura);
+            }
+            let mut result = Ok(());
+            if job.frame.is_some() && job.frame != sent_frame {
+                result = core::send_frame(job.frame.as_ref().unwrap()).map_err(|e| format!("Couldn't set the lights: {e}"));
+                sent_frame = job.frame;
+            }
+            if let (Some(a), Some(job)) = (&aura, job.aura) {
+                if !job.0.is_empty() && Some(&job) != sent_aura.as_ref() {
+                    result = result.and(a.apply(&job.0, job.1, job.2).map_err(|e| format!("Couldn't set the motherboard lights: {e}")));
+                    sent_aura = Some(job);
+                }
+            }
+            if let Err(e) = result {
+                *slot.lock().unwrap() = Some(format!("{e}. Use Fix under Setup."));
+                // Try again next time, e.g. after Fix.
+                (sent_frame, sent_aura) = (None, None);
+            }
+        }
+    });
+    (tx, error)
+}
+
+/// What a color picker sets.
+#[derive(Clone, Copy)]
+enum LightTarget {
+    All,
+    Channel(usize),
+    /// Index into `aura_colors`.
+    Aura(usize),
+}
+
+/// Pure colors for the picker: the theme's are softened for screens,
+/// and its "red" comes out pink on LEDs.
+fn led_presets() -> Vec<Hsla> {
+    [0xff0000, 0xff4000, 0xff9000, 0xffff00, 0x00ff00, 0x00ffff, 0x0000ff, 0x8000ff, 0xff00ff, 0xffffff]
+        .into_iter()
+        .map(|c| rgb(c).into())
+        .collect()
+}
+
+fn rgb_to_hsla([r, g, b]: [u8; 3]) -> Hsla {
+    rgb(u32::from_be_bytes([0, r, g, b])).into()
+}
+
+fn hsla_to_rgb(c: Hsla) -> [u8; 3] {
+    let c = Rgba::from(c);
+    [c.r, c.g, c.b].map(|v| (v * 255.0).round() as u8)
+}
 
 /// `editing` key for the "new profile" name field.
 const NEW_PROFILE: &str = "profile:new";
@@ -376,6 +473,25 @@ struct FanControl {
     names: HashMap<String, String>,
     hidden: HashSet<String>,
     profiles: Vec<String>,
+    lights: [Light; LIGHT_CHANNELS],
+    light_pickers: Vec<Entity<ColorPickerState>>,
+    /// Sets every channel at once.
+    all_lights_picker: Entity<ColorPickerState>,
+    lights_present: bool,
+    lights_enabled: bool,
+    effect: Effect,
+    speed: u8,
+    /// Channels Snake and Fan rainbow go through, in order.
+    order: Vec<usize>,
+    speed_slider: Entity<SliderState>,
+    fps: u8,
+    fps_slider: Entity<SliderState>,
+    light_tx: mpsc::Sender<LightJob>,
+    light_error: Arc<Mutex<Option<String>>>,
+    /// Per motherboard zone; `None` until the user picks one, so the board keeps its own effect.
+    aura_colors: Vec<(u8, Option<[u8; 3]>)>,
+    aura_pickers: Vec<Entity<ColorPickerState>>,
+    guide: Option<Guide>,
     service: Service,
     editing: Option<(String, Entity<InputState>)>,
     error: Option<String>,
@@ -455,6 +571,49 @@ impl FanControl {
             }
         }
 
+        let lights_text = read_config("lights");
+        let lights = core::parse_lights(&lights_text);
+        let aura = core::Aura::find();
+        let saved_aura = core::parse_aura(&lights_text);
+        let aura_colors: Vec<(u8, Option<[u8; 3]>)> =
+            aura.as_ref().map_or(vec![], |a| a.zones().into_iter().map(|z| (z, saved_aura.get(&z).copied())).collect());
+        let (light_tx, light_error) = spawn_light_sender(aura);
+        let (effect, speed) = core::parse_effect(&lights_text);
+        let speed_slider = cx.new(|_| SliderState::new().min(1.0).max(core::MAX_SPEED as f32).step(1.0).default_value(speed as f32));
+        subs.push(cx.subscribe(&speed_slider, |this, _, ev: &SliderEvent, cx| match ev {
+            SliderEvent::Change(v) => {
+                this.speed = v.start() as u8;
+                cx.notify();
+            }
+            SliderEvent::Release(_) => this.save_lights(),
+        }));
+        let fps = core::parse_fps(&lights_text);
+        let fps_slider =
+            cx.new(|_| SliderState::new().min(core::MIN_FPS as f32).max(core::MAX_FPS as f32).step(5.0).default_value(fps as f32));
+        subs.push(cx.subscribe(&fps_slider, |this, _, ev: &SliderEvent, cx| match ev {
+            SliderEvent::Change(v) => {
+                this.fps = v.start() as u8;
+                cx.notify();
+            }
+            SliderEvent::Release(_) => this.save_lights(),
+        }));
+        let mut picker = |color: Option<[u8; 3]>, target: LightTarget, subs: &mut Vec<Subscription>| {
+            let state = cx.new(|cx| {
+                let s = ColorPickerState::new(window, cx);
+                if let Some(c) = color { s.default_value(rgb_to_hsla(c)) } else { s }
+            });
+            subs.push(cx.subscribe(&state, move |this, _, ev: &ColorPickerEvent, cx| {
+                if let ColorPickerEvent::Change(Some(c)) = ev {
+                    this.set_light_color(target, hsla_to_rgb(*c));
+                    cx.notify();
+                }
+            }));
+            state
+        };
+        let light_pickers = (0..LIGHT_CHANNELS).map(|i| picker(Some(lights[i].rgb), LightTarget::Channel(i), &mut subs)).collect();
+        let aura_pickers = aura_colors.iter().enumerate().map(|(i, (_, c))| picker(*c, LightTarget::Aura(i), &mut subs)).collect();
+        let all_lights_picker = picker(None, LightTarget::All, &mut subs);
+
         let poll = cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let alive = this.update_in(cx, |this, window, cx| {
@@ -473,6 +632,22 @@ impl FanControl {
             names,
             hidden: read_config("hidden-sensors").lines().map(String::from).collect(),
             profiles: list_profiles(),
+            lights,
+            light_pickers,
+            all_lights_picker,
+            lights_present: core::lights_present() || !aura_colors.is_empty(),
+            light_tx,
+            light_error,
+            effect,
+            speed,
+            order: core::parse_order(&lights_text, &lights),
+            speed_slider,
+            fps,
+            fps_slider,
+            aura_colors,
+            aura_pickers,
+            lights_enabled: core::lights_enabled(&lights_text),
+            guide: None,
             service: Service::default(),
             editing: None,
             error: core::running_as_root().then(|| {
@@ -498,7 +673,132 @@ impl FanControl {
         this.onboarding = needs_onboarding(&this.service.items(), skipped.as_deref());
         this.apply_state(&parse_kv(&read_config("fans")), window, cx);
         this.refresh(window, cx);
+        // After a reboot the daemon does this; without it, opening the window does.
+        if this.lights_enabled && !this.service.running {
+            this.save_lights();
+        }
         this
+    }
+
+    fn send_lights(&mut self, frame: core::Frame) {
+        let _ = self.light_tx.send(LightJob { frame: Some(frame), aura: None });
+    }
+
+    /// The motherboard's zones the user picked a color for. `dark`: all off instead.
+    fn send_aura(&mut self, dark: bool) {
+        let colors = self.aura_colors.iter().filter_map(|&(z, c)| Some((z, if dark { [0; 3] } else { c? }))).collect();
+        let (effect, speed) = if dark { (Effect::Static, 1) } else { (self.effect, self.speed) };
+        let _ = self.light_tx.send(LightJob { frame: None, aura: Some((colors, effect, speed)) });
+    }
+
+    fn save_lights(&mut self) {
+        if self.lights_enabled {
+            // Nollie effects are animated by the background service.
+            if self.effect == Effect::Static {
+                self.send_lights(core::lights_frame(&self.lights));
+            }
+            self.send_aura(false);
+        }
+        let aura: Vec<(u8, [u8; 3])> = self.aura_colors.iter().filter_map(|&(z, c)| Some((z, c?))).collect();
+        self.save("lights", core::format_lights(self.lights_enabled, &self.lights, &aura, self.effect, self.speed, self.fps, &self.order));
+    }
+
+    /// Off turns every LED off and leaves the controllers alone from then on.
+    fn set_lights_enabled(&mut self, on: bool) {
+        if !on {
+            self.send_lights(core::dark_frame());
+            self.send_aura(true);
+        }
+        self.lights_enabled = on;
+        self.save_lights();
+    }
+
+    fn start_guide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        core::set_light_guide(true);
+        self.guide_step(0, window, cx);
+    }
+
+    fn guide_step(&mut self, channel: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let key = format!("light:ch{}", channel + 1);
+        let name_text = self.names.get(&key).cloned().unwrap_or_default();
+        let leds_text = match self.lights[channel].leds {
+            0 => String::new(),
+            n => n.to_string(),
+        };
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Front fans").default_value(name_text));
+        let leds = cx.new(|cx| InputState::new(window, cx).placeholder("LEDs").default_value(leds_text));
+        name.update(cx, |s, cx| s.focus(window, cx));
+        let on_input = |this: &mut Self, ev: &InputEvent, window: &mut Window, cx: &mut Context<Self>| match ev {
+            InputEvent::Change => this.guide_preview(cx),
+            InputEvent::PressEnter { .. } => this.guide_next(false, window, cx),
+            _ => {}
+        };
+        let subs = vec![
+            cx.subscribe_in(&name, window, move |this, _, ev, window, cx| on_input(this, ev, window, cx)),
+            cx.subscribe_in(&leds, window, move |this, _, ev, window, cx| on_input(this, ev, window, cx)),
+        ];
+        self.guide = Some(Guide { channel, name, leds, _subs: subs });
+        self.guide_preview(cx);
+        cx.notify();
+    }
+
+    /// The LED count typed in the guide, if it's a number.
+    fn guide_leds(&self, cx: &App) -> Option<u16> {
+        let g = self.guide.as_ref()?;
+        g.leds.read(cx).value().trim().parse::<u16>().ok().map(|n| n.min(MAX_LEDS))
+    }
+
+    fn guide_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(channel) = self.guide.as_ref().map(|g| g.channel) else { return };
+        self.send_lights(guide_frame(channel, self.guide_leds(cx)));
+        cx.notify();
+    }
+
+    /// Keep what was typed for the current channel. `empty`: nothing's plugged in.
+    fn guide_keep(&mut self, empty: bool, cx: &mut Context<Self>) {
+        let Some(g) = &self.guide else { return };
+        let (channel, name) = (g.channel, g.name.read(cx).value().trim().to_string());
+        self.lights[channel].leds = if empty { 0 } else { self.guide_leds(cx).unwrap_or(0) };
+        // A default white instead of black, so a newly found channel lights up.
+        if self.lights[channel].leds > 0 && self.lights[channel].rgb == [0; 3] {
+            self.lights[channel].rgb = [255; 3];
+        }
+        self.set_name(format!("light:ch{}", channel + 1), name);
+    }
+
+    fn guide_next(&mut self, empty: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(channel) = self.guide.as_ref().map(|g| g.channel) else { return };
+        self.guide_keep(empty, cx);
+        if channel + 1 < LIGHT_CHANNELS {
+            self.guide_step(channel + 1, window, cx);
+        } else {
+            self.finish_guide(cx);
+        }
+    }
+
+    fn guide_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(channel) = self.guide.as_ref().map(|g| g.channel) else { return };
+        self.guide_keep(false, cx);
+        self.guide_step(channel.saturating_sub(1), window, cx);
+    }
+
+    fn finish_guide(&mut self, cx: &mut Context<Self>) {
+        self.guide = None;
+        core::set_light_guide(false);
+        self.save_lights();
+        cx.notify();
+    }
+
+    fn set_light_color(&mut self, target: LightTarget, color: [u8; 3]) {
+        match target {
+            LightTarget::Channel(i) => self.lights[i].rgb = color,
+            LightTarget::Aura(i) => self.aura_colors[i].1 = Some(color),
+            LightTarget::All => {
+                self.lights.iter_mut().for_each(|l| l.rgb = color);
+                self.aura_colors.iter_mut().for_each(|z| z.1 = Some(color));
+            }
+        }
+        self.save_lights();
     }
 
     /// Apply `fan key -> mode` (+ `key#curve`) from the `fans` file or a profile.
@@ -546,6 +846,9 @@ impl FanControl {
     }
 
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(e) = self.light_error.lock().unwrap().take() {
+            self.error = Some(e);
+        }
         for s in self.groups.iter_mut().flat_map(|g| &mut g.sensors) {
             if !self.hidden.contains(&s.key) {
                 s.value = match s.read {
@@ -669,6 +972,20 @@ impl FanControl {
             cx.notify();
             return;
         }
+        if let Some(i) = key.strip_prefix(LEDS).and_then(|i| i.parse::<usize>().ok()) {
+            if let Ok(n) = name.parse::<u16>() {
+                self.lights[i].leds = n.min(MAX_LEDS);
+                self.save_lights();
+            }
+            cx.notify();
+            return;
+        }
+        self.set_name(key, name);
+        cx.notify();
+    }
+
+    /// Empty name = back to the default.
+    fn set_name(&mut self, key: String, name: String) {
         if name.is_empty() {
             self.names.remove(&key);
         } else {
@@ -677,7 +994,6 @@ impl FanControl {
         let contents = "# chip/sensor = Name, or chip@device/sensor = Name (written by the app)\n".to_string()
             + &format_kv(self.names.iter());
         self.save("names", contents);
-        cx.notify();
     }
 
     /// A name that turns into a text field on double-click.
@@ -1074,6 +1390,271 @@ impl FanControl {
             .into_any_element()
     }
 
+    fn lights_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let app = cx.entity();
+        let switch = Switch::new("lights-enabled")
+            .checked(self.lights_enabled)
+            .on_change(move |on, _, cx| app.update(cx, |this, cx| {
+                this.set_lights_enabled(*on);
+                cx.notify();
+            }));
+        let header = |extra: Vec<AnyElement>, cx: &Context<Self>| {
+            h_flex()
+                .gap_3()
+                .child(div().flex_1().min_w_0().text_lg().font_semibold().child(self.renamable("section:lights", "Lighting", cx)))
+                .children(extra)
+        };
+        let muted = cx.theme().muted_foreground;
+        if !self.lights_enabled {
+            return v_flex()
+                .gap_4()
+                .child(header(vec![switch.into_any_element()], cx))
+                .child(div().text_sm().text_color(muted).child(
+                    "ARGB controller found. Turn this on to set its colors from here. While it's off, fanctlrs leaves the controller alone.",
+                ))
+                .into_any_element();
+        }
+        if let Some(g) = &self.guide {
+            let t = cx.theme();
+            let n = g.channel + 1;
+            let hint = match self.guide_leds(cx) {
+                None | Some(0) => format!(
+                    "Channel {n} is lit white, everything else is off. Nothing lit? Then nothing's plugged in here. \
+                     Otherwise type its LED count: that many LEDs turn green and any beyond it red."
+                ),
+                Some(_) => "Raise the count until nothing is red. A fan usually has 8 to 16 LEDs; add them up for chained fans.".into(),
+            };
+            let guide = Self::card(t)
+                .p_3()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .child(div().flex_1().font_semibold().child(format!("Channel {n} of {LIGHT_CHANNELS}")))
+                        .child(Button::new("guide-cancel").label("Done").ghost().small().on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.guide_keep(false, cx);
+                                this.finish_guide(cx);
+                            }),
+                        )),
+                )
+                .child(div().text_color(t.muted_foreground).child(hint))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_1().child(Input::new(&g.name).small()))
+                        .child(div().w(px(72.)).child(Input::new(&g.leds).small())),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Button::new("guide-back").label("Back").ghost().small().disabled(g.channel == 0).on_click(
+                            cx.listener(|this, _, window, cx| this.guide_back(window, cx)),
+                        ))
+                        .child(div().flex_1())
+                        .child(Button::new("guide-empty").label("Nothing plugged in").outline().small().on_click(
+                            cx.listener(|this, _, window, cx| this.guide_next(true, window, cx)),
+                        ))
+                        .child(
+                            Button::new("guide-next")
+                                .label(if n == LIGHT_CHANNELS { "Finish" } else { "Next" })
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| this.guide_next(false, window, cx))),
+                        ),
+                );
+            return v_flex().gap_4().child(header(vec![switch.into_any_element()], cx)).child(guide).into_any_element();
+        }
+        // Pickers follow the saved colors (e.g. after "All"); setting them emits no change.
+        // The "all" picker shows the color shared by everything in use, if they agree.
+        let mut used = self.lights.iter().filter(|l| l.leds > 0).map(|l| l.rgb).chain(self.aura_colors.iter().filter_map(|z| z.1));
+        let shared = used.next().filter(|first| used.all(|c| c == *first));
+        let pickers = self.light_pickers.iter().zip(self.lights.iter().map(|l| Some(l.rgb)));
+        let pickers = pickers.chain(self.aura_pickers.iter().zip(self.aura_colors.iter().map(|z| z.1)));
+        for (picker, color) in pickers.chain([(&self.all_lights_picker, shared)]) {
+            if let Some(c) = color.filter(|&c| picker.read(cx).value().map(hsla_to_rgb) != Some(c)) {
+                picker.update(cx, |s, cx| s.set_value(rgb_to_hsla(c), window, cx));
+            }
+        }
+        let t = cx.theme();
+        let configured = self.lights.iter().any(|l| l.leds > 0);
+        let rows = self.lights.iter().zip(&self.light_pickers).enumerate().filter(|(_, (l, _))| l.leds > 0).map(|(i, (l, picker))| {
+            let key = format!("light:ch{}", i + 1);
+            let edit_key = format!("{LEDS}{i}");
+            let count = match &self.editing {
+                Some((k, state)) if *k == edit_key => div().w(px(64.)).child(Input::new(state).small()).into_any_element(),
+                _ => {
+                    let text = l.leds.to_string();
+                    Button::new(("leds", i))
+                        .label(format!("{} LEDs", l.leds))
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, window, cx| this.start_edit(edit_key.clone(), text.clone(), window, cx)))
+                        .into_any_element()
+                }
+            };
+            h_flex()
+                .gap_2()
+                .min_h(px(28.))
+                .opacity(if l.leds == 0 { 0.55 } else { 1.0 })
+                .child(ColorPicker::new(picker).featured_colors(led_presets()).small())
+                .child(div().flex_1().min_w_0().child(self.renamable(&key, &format!("Channel {}", i + 1), cx)))
+                .child(count)
+        });
+        v_flex()
+            .gap_4()
+            .child(header(
+                vec![
+                    div().text_sm().text_color(t.muted_foreground).child("All").into_any_element(),
+                    ColorPicker::new(&self.all_lights_picker).featured_colors(led_presets()).small().into_any_element(),
+                    switch.into_any_element(),
+                ],
+                cx,
+            ))
+            .child(div().text_sm().text_color(t.muted_foreground).child(if configured {
+                "Close OpenRGB, or the two will fight over the colors."
+            } else {
+                "Run the setup guide to find which channels have something plugged in."
+            }))
+            .child(self.effect_row(cx))
+            .children(configured.then(|| Self::card(t).py_2().children(rows)))
+            .children((!self.aura_colors.is_empty()).then(|| {
+                let zones = self.aura_colors.iter().zip(&self.aura_pickers).map(|(&(zone, _), picker)| {
+                    h_flex()
+                        .gap_2()
+                        .min_h(px(28.))
+                        .child(ColorPicker::new(picker).featured_colors(led_presets()).small())
+                        .child(div().flex_1().min_w_0().child(self.renamable(&format!("aura:{zone:02x}"), &core::aura_zone_name(zone), cx)))
+                });
+                Self::card(t)
+                    .py_2()
+                    .child(div().pb_1().text_xs().font_semibold().text_color(t.muted_foreground).child("Motherboard"))
+                    .children(zones)
+            }))
+            .child(
+                h_flex().child(
+                    Button::new("guide-start")
+                        .icon(IconName::Settings)
+                        .label("Channel setup guide")
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, window, cx| this.start_guide(window, cx))),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// The order list, shown in the Order popover. Runs in the popover's
+    /// context, so clicks go through `app` like the show/hide pickers.
+    fn order_list(&self, app: &Entity<Self>, t: &Theme) -> Div {
+        let name = |i: usize| self.display(&format!("light:ch{}", i + 1), &format!("Channel {}", i + 1)).to_string();
+        // Channels emptied by the guide since stay saved but out of the way.
+        let order: Vec<usize> = self.order.iter().copied().filter(|&i| self.lights[i].leds > 0).collect();
+        let last = order.len().saturating_sub(1);
+        let act = |f: fn(&mut Self, usize, usize), pos: usize, i: usize| {
+            let app = app.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                app.update(cx, |this, cx| {
+                    f(this, pos, i);
+                    this.save_lights();
+                    cx.notify();
+                })
+            }
+        };
+        let rows = order.iter().enumerate().map(|(pos, &i)| {
+            let saved = self.order.iter().position(|&c| c == i).unwrap_or(pos);
+            h_flex()
+                .gap_1()
+                .min_h(px(28.))
+                .child(div().w(px(20.)).text_color(t.muted_foreground).child(format!("{}", pos + 1)))
+                .child(div().flex_1().min_w_0().truncate().child(name(i)))
+                .child(Button::new(("order-up", i)).icon(IconName::ChevronUp).ghost().xsmall().disabled(pos == 0).on_click(act(
+                    |this, saved, _| this.order.swap(saved, saved - 1),
+                    saved,
+                    i,
+                )))
+                .child(Button::new(("order-down", i)).icon(IconName::ChevronDown).ghost().xsmall().disabled(pos == last).on_click(
+                    act(|this, saved, _| this.order.swap(saved, saved + 1), saved, i),
+                ))
+                .child(Button::new(("order-remove", i)).icon(IconName::Close).ghost().xsmall().on_click(act(
+                    |this, _, i| this.order.retain(|&c| c != i),
+                    saved,
+                    i,
+                )))
+        });
+        let left_out = (0..LIGHT_CHANNELS).filter(|i| self.lights[*i].leds > 0 && !order.contains(i)).map(|i| {
+            h_flex()
+                .gap_1()
+                .min_h(px(28.))
+                .text_color(t.muted_foreground)
+                .child(div().w(px(20.)))
+                .child(div().flex_1().min_w_0().truncate().child(name(i)))
+                .child(Button::new(("order-add", i)).icon(IconName::Plus).label("Add").ghost().xsmall().on_click(act(
+                    |this, _, i| {
+                        this.order.retain(|&c| c != i);
+                        this.order.push(i);
+                    },
+                    0,
+                    i,
+                )))
+        });
+        v_flex()
+            .w(px(300.))
+            .gap_0p5()
+            .text_sm()
+            .child(div().pb_2().text_color(t.muted_foreground).child(
+                "The effect goes from top to bottom, then starts over. Lights left out keep their color.",
+            ))
+            .children(rows)
+            .children(left_out)
+    }
+
+    fn effect_row(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = cx.theme();
+        let buttons = Effect::ALL.into_iter().enumerate().map(|(i, effect)| {
+            let b = Button::new(("effect", i)).label(effect.label()).small();
+            let b = if self.effect == effect { b.primary() } else { b.ghost() };
+            b.on_click(cx.listener(move |this, _, _, cx| {
+                this.effect = effect;
+                this.save_lights();
+                cx.notify();
+            }))
+        });
+        let animated = self.effect != Effect::Static;
+        let app = cx.entity();
+        let order = self.effect.uses_order().then(|| {
+            Popover::new("order")
+                .anchor(Anchor::TopRight)
+                .trigger(Button::new("order-button").icon(assets::IconName::ListOrdered).label("Order").outline().small())
+                .content(move |_, _, cx| app.read(cx).order_list(&app, cx.theme()))
+        });
+        v_flex()
+            .gap_2()
+            .child(h_flex().flex_wrap().gap_1().children(buttons))
+            .children(animated.then(|| {
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().text_color(t.muted_foreground).child("Speed"))
+                    .child(Slider::new(&self.speed_slider).flex_1())
+                    .child(div().w(px(20.)).text_right().text_sm().child(self.speed.to_string()))
+                    .children(order)
+            }))
+            .children(animated.then(|| {
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().text_color(t.muted_foreground).child("Smoothness"))
+                    .child(Slider::new(&self.fps_slider).flex_1())
+                    .child(div().w(px(48.)).text_right().text_sm().child(format!("{} fps", self.fps)))
+            }))
+            .children((animated && !self.service.running).then(|| {
+                div()
+                    .text_sm()
+                    .text_color(t.warning)
+                    .child("Effects on the ARGB controller run in the background service: install it under Setup.")
+            }))
+    }
+
     fn finish_onboarding(&mut self) {
         let items = self.service.items();
         if items.iter().all(|(_, ok)| *ok) {
@@ -1190,7 +1771,7 @@ impl FanControl {
 }
 
 impl Render for FanControl {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let error = self.error.clone().map(|e| {
             div()
                 .px_4()
@@ -1207,7 +1788,8 @@ impl Render for FanControl {
             self.onboarding_view(cx).into_any_element()
         } else {
             let service = self.service_section(true, cx);
-            v_flex().gap_8().child(sensors).child(fans).child(service).into_any_element()
+            let lights = (self.lights_present || self.lights.iter().any(|l| l.leds > 0)).then(|| self.lights_section(window, cx));
+            v_flex().gap_8().child(sensors).child(fans).children(lights).child(service).into_any_element()
         };
         div()
             .size_full()
@@ -1267,7 +1849,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, cpu_times, energy_power, matches_profile, needs_onboarding, parse_sensor_file, ram_used};
+    use super::{Kind, cpu_times, energy_power, guide_frame, matches_profile, needs_onboarding, parse_sensor_file, ram_used};
     use crate::core::parse_kv;
 
     #[test]
@@ -1322,5 +1904,13 @@ mod tests {
         // the counter wrapped: 10 J before the wrap + 20 J after it, in 1 s
         assert_eq!(energy_power(990_000_000.0, 20_000_000.0, 1_000_000_000.0, 1.0), Some(30_000_000.0));
         assert_eq!(energy_power(0.0, 1.0, 1e12, 0.0), None);
+    }
+
+    #[test]
+    fn light_guide() {
+        let f = guide_frame(2, Some(12));
+        assert_eq!((f[2][11], f[2][12], f[2].len()), ([0, 255, 0], [255, 0, 0], 256));
+        assert!(f[0].iter().all(|c| *c == [0; 3])); // every other channel off
+        assert!(guide_frame(2, None)[2].iter().all(|c| *c == [255; 3]));
     }
 }
